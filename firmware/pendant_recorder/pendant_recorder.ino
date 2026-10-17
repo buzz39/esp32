@@ -3,8 +3,7 @@
  * ------------------------------------------------------------------
  * Hardware : ESP32-C3 Super Mini + INMP441 (I2S) + microSD (SPI)
  *            + one push button + status LED + TP4056 + LiPo 3.7V
- * Arduino  : esp32 core 2.0.x OR 3.x — the I2S driver is picked automatically
- *            (3.x uses driver/i2s_std.h, 2.x uses the legacy driver/i2s.h)
+ * Arduino  : esp32 core 3.x (tested on 3.3.12, ESP32-C3 Super Mini)
  * Board    : "ESP32C3 Dev Module", USB CDC On Boot = Enabled
  *
  * Button:
@@ -19,9 +18,9 @@
  *
  * Idle uses light sleep so a 500 mAh cell lasts weeks.
  *
- * NOTE: not compiled on real hardware. If you get silence or pure noise,
- *       tune SAMPLE_SHIFT (INMP441 puts 24-bit data in a 32-bit slot and the
- *       right shift varies between board clones): try 8, 11, 12.
+ * Mic path verified on the bench (Oct 2026): stereo I2S read, mic in slot A
+ * (L/R = GND), 24-bit sample, DC removed, /GAIN_DIV to 16-bit. Normal speech
+ * at 20-30 cm gave rms ~2000 with no clipping at GAIN_DIV 128.
  */
 
 #include <Arduino.h>
@@ -43,14 +42,14 @@
 #define PIN_SD_MISO  4
 
 #define PIN_BTN      2    // button to GND, internal pull-up
-#define PIN_LED      8    // onboard LED on most Super Mini boards
+#define PIN_LED      8    // onboard LED, active LOW on the Super Mini
 
 // ---------------- config ----------------
 #define SAMPLE_RATE      16000
-#define SAMPLE_SHIFT     11     // 8 / 11 / 12 — tune to your board
+#define GAIN_DIV         128.0f // 24-bit -> 16-bit is /256; 128 = 2x. Lower = louder
 #define I2S_BUF_FRAMES   256
 
-#define USE_LIGHT_SLEEP  1      // 1 = weeks of standby, 0 = simple busy loop
+#define USE_LIGHT_SLEEP  0      // 1 = weeks of standby (breaks USB serial), 0 = bench mode
 #define SYNC_HOLD_MS     3000   // hold this long for the WiFi hotspot
 #define SYNC_TIMEOUT_MS  300000 // leave sync after 5 min of no activity
 
@@ -62,11 +61,15 @@
 //  build with esp32 core 3.x -> new i2s_std driver
 //  build with esp32 core 2.x -> legacy i2s driver
 // =====================================================================
-#if ESP_ARDUINO_VERSION_MAJOR >= 3
+#if ESP_ARDUINO_VERSION_MAJOR < 3
+#error "Needs esp32 Arduino core 3.x (Boards Manager -> esp32 by Espressif)"
+#endif
 #include <driver/i2s_std.h>
 
 static i2s_chan_handle_t s_rx = nullptr;
 
+// Read BOTH slots: on this board/mic combo that is the proven working setup.
+// The mic (L/R = GND) is in slot A; slot B is ignored.
 static bool micInit() {
   i2s_chan_config_t ch = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
   ch.dma_desc_num  = 8;
@@ -76,8 +79,8 @@ static bool micInit() {
   i2s_std_config_t cfg = {};
   cfg.clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE);
   cfg.slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT,
-                                                    I2S_SLOT_MODE_MONO);
-  cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;      // mic L/R pin tied to GND
+                                                    I2S_SLOT_MODE_STEREO);
+  cfg.slot_cfg.slot_mask = I2S_STD_SLOT_BOTH;
   cfg.gpio_cfg.mclk = I2S_GPIO_UNUSED;
   cfg.gpio_cfg.bclk = (gpio_num_t)PIN_I2S_BCLK;
   cfg.gpio_cfg.ws   = (gpio_num_t)PIN_I2S_WS;
@@ -88,47 +91,13 @@ static bool micInit() {
 }
 static void micStart() { i2s_channel_enable(s_rx); }
 static void micStop()  { i2s_channel_disable(s_rx); }
-static void micFree()  { if (s_rx) { i2s_del_channel(s_rx); s_rx = nullptr; } }
 static size_t micRead(void *buf, size_t len) {
   size_t br = 0;
   if (i2s_channel_read(s_rx, buf, len, &br, pdMS_TO_TICKS(200)) != ESP_OK) return 0;
   return br;
 }
 
-#else
-#include <driver/i2s.h>
-
-static bool micInit() {
-  i2s_config_t cfg = {};
-  cfg.mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX);
-  cfg.sample_rate          = SAMPLE_RATE;
-  cfg.bits_per_sample      = I2S_BITS_PER_SAMPLE_32BIT;
-  cfg.channel_format       = I2S_CHANNEL_FMT_ONLY_LEFT;
-  cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
-  cfg.intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1;
-  cfg.dma_buf_count        = 8;
-  cfg.dma_buf_len          = I2S_BUF_FRAMES;
-  cfg.use_apll             = false;
-  if (i2s_driver_install(I2S_NUM_0, &cfg, 0, nullptr) != ESP_OK) return false;
-
-  i2s_pin_config_t pins = {};
-  pins.bck_io_num   = PIN_I2S_BCLK;
-  pins.ws_io_num    = PIN_I2S_WS;
-  pins.data_out_num = I2S_PIN_NO_CHANGE;
-  pins.data_in_num  = PIN_I2S_DIN;
-  i2s_set_pin(I2S_NUM_0, &pins);
-  i2s_stop(I2S_NUM_0);          // stay idle until we ask for audio
-  return true;
-}
-static void micStart() { i2s_start(I2S_NUM_0); }
-static void micStop()  { i2s_stop(I2S_NUM_0); }
-static void micFree()  { i2s_driver_uninstall(I2S_NUM_0); }
-static size_t micRead(void *buf, size_t len) {
-  size_t br = 0;
-  if (i2s_read(I2S_NUM_0, buf, len, &br, 200 / portTICK_PERIOD_MS) != ESP_OK) return 0;
-  return br;
-}
-#endif
+static void led(bool on) { digitalWrite(PIN_LED, on ? LOW : HIGH); }
 
 // ---------------- state ----------------
 enum Mode { MODE_IDLE, MODE_REC, MODE_SYNC };
@@ -137,7 +106,9 @@ static Mode      g_mode       = MODE_IDLE;
 static File      g_file;
 static uint32_t  g_dataBytes  = 0;
 static uint32_t  g_fileIndex  = 0;
-static uint8_t   g_i2sBuf[I2S_BUF_FRAMES * 4];
+static int32_t   g_i2sBuf[I2S_BUF_FRAMES * 2];   // stereo frames: A,B,A,B...
+static float     g_dcX = 0, g_dcY = 0;           // DC-removal filter state
+static uint32_t  g_lastFlush = 0;
 static WebServer g_server(80);
 static uint32_t  g_lastSyncActivity = 0;
 
@@ -194,10 +165,13 @@ static bool startRecording() {
   g_dataBytes = 0;
 
   micStart();
-  micRead(g_i2sBuf, sizeof(g_i2sBuf));   // discard stale DMA frames
+  for (int i = 0; i < 6; i++)            // mic start-up (~100 ms) + stale DMA
+    micRead(g_i2sBuf, sizeof(g_i2sBuf));
+  g_dcX = g_dcY = 0;
+  g_lastFlush = millis();
 
   g_mode = MODE_REC;
-  digitalWrite(PIN_LED, HIGH);
+  led(true);
   Serial.printf("recording -> %s\n", name);
   return true;
 }
@@ -210,7 +184,7 @@ static void stopRecording() {
   writeWavHeader(g_file, g_dataBytes);   // patch real sizes
   g_file.flush();
   g_file.close();
-  digitalWrite(PIN_LED, LOW);
+  led(false);
   g_mode = MODE_IDLE;
   Serial.printf("saved: %lu bytes (~%lu s)\n",
                 (unsigned long)g_dataBytes,
@@ -224,18 +198,30 @@ static void pumpAudio() {
   size_t bytesRead = micRead(g_i2sBuf, sizeof(g_i2sBuf));
   if (bytesRead == 0) return;
 
-  size_t frames = bytesRead / 4;
+  size_t frames = bytesRead / 8;                 // 2 slots x 4 bytes
   static int16_t out[I2S_BUF_FRAMES];
   for (size_t i = 0; i < frames; i++) {
-    int32_t raw;
-    memcpy(&raw, g_i2sBuf + i * 4, 4);
-    int32_t s = raw >> SAMPLE_SHIFT;
-    if (s > 32767)  s = 32767;
-    if (s < -32768) s = -32768;
-    out[i] = (int16_t)s;
+    float x = (float)(g_i2sBuf[2 * i] >> 8);     // slot A, 24-bit sample
+    float y = x - g_dcX + 0.995f * g_dcY;        // remove DC / slow drift
+    g_dcX = x; g_dcY = y;
+    float o = y / GAIN_DIV;
+    if (o > 32767)  o = 32767;
+    if (o < -32768) o = -32768;
+    out[i] = (int16_t)o;
   }
   g_file.write((const uint8_t *)out, frames * 2);
   g_dataBytes += frames * 2;
+
+  // every 5 s, patch the header and flush so a crash or dead battery
+  // still leaves a playable file
+  if (millis() - g_lastFlush > 5000) {
+    uint32_t pos = g_file.position();
+    g_file.seek(0);
+    writeWavHeader(g_file, g_dataBytes);
+    g_file.seek(pos);
+    g_file.flush();
+    g_lastFlush = millis();
+  }
 }
 
 // ---------------------------------------------------------------- sync server
@@ -348,6 +334,7 @@ static void enterSyncMode() {
   Serial.println("sync mode: joining WiFi...");
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASS);
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);   // Super Mini: hotspot is often invisible at full power
   delay(200);
   Serial.printf("AP '%s' at http://%s\n", AP_SSID,
                 WiFi.softAPIP().toString().c_str());
@@ -361,7 +348,7 @@ static void exitSyncMode() {
   g_server.stop();
   WiFi.softAPdisconnect(true);
   WiFi.mode(WIFI_OFF);
-  digitalWrite(PIN_LED, LOW);
+  led(false);
   g_mode = MODE_IDLE;
   Serial.println("sync mode off");
 }
@@ -373,7 +360,7 @@ static void serviceSync() {
     exitSyncMode();
   }
   // fast blink while in sync mode
-  digitalWrite(PIN_LED, (millis() / 150) % 2);
+  led((millis() / 150) % 2);
 }
 
 // ---------------------------------------------------------------- power
@@ -413,16 +400,17 @@ static uint8_t readButton() {
 
 void setup() {
   Serial.begin(115200);
-  delay(300);
+  uint32_t t0 = millis();
+  while (!Serial && millis() - t0 < 3000) delay(20);   // brief wait, never blocks on battery
 
   pinMode(PIN_BTN, INPUT_PULLUP);
   pinMode(PIN_LED, OUTPUT);
-  digitalWrite(PIN_LED, LOW);
+  led(false);
 
   SPI.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_CS);
   if (!SD.begin(PIN_SD_CS, SPI, 4000000)) {
     Serial.println("!! SD mount failed (check wiring / FAT32).");
-    for (;;) { digitalWrite(PIN_LED, !digitalRead(PIN_LED)); delay(80); }
+    for (bool on = false;; on = !on) { led(on); delay(80); }   // fast blink = SD problem
   }
   Serial.printf("SD ok, %llu MB\n",
                 (unsigned long long)(SD.cardSize() / (1024ULL * 1024ULL)));

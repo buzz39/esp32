@@ -46,6 +46,8 @@
 #define MIC_SECONDS      4
 #define LED_ACTIVE_LOW   1     // set to 0 if your LED behaves the other way
 
+struct ChStat { double sq8=0, sq11=0, sq12=0; int32_t mn=0, mx=0; int64_t n=0; };
+
 // =====================================================================
 //  microphone driver - one thin wrapper, two implementations
 // =====================================================================
@@ -67,8 +69,8 @@ static bool micInit() {
   i2s_std_config_t cfg = {};
   cfg.clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE);
   cfg.slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT,
-                                                    I2S_SLOT_MODE_MONO);
-  cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;      // mic L/R pin tied to GND
+                                                    I2S_SLOT_MODE_STEREO);
+  cfg.slot_cfg.slot_mask = I2S_STD_SLOT_BOTH;      // read both, report each
   cfg.gpio_cfg.mclk = I2S_GPIO_UNUSED;
   cfg.gpio_cfg.bclk = (gpio_num_t)PIN_I2S_BCLK;
   cfg.gpio_cfg.ws   = (gpio_num_t)PIN_I2S_WS;
@@ -99,7 +101,7 @@ static bool micInit() {
   cfg.mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX);
   cfg.sample_rate          = SAMPLE_RATE;
   cfg.bits_per_sample      = I2S_BITS_PER_SAMPLE_32BIT;
-  cfg.channel_format       = I2S_CHANNEL_FMT_ONLY_LEFT;
+  cfg.channel_format       = I2S_CHANNEL_FMT_RIGHT_LEFT;
   cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
   cfg.intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1;
   cfg.dma_buf_count        = 8;
@@ -182,61 +184,84 @@ static void testButton() {
 }
 
 // ------------------------------------------------------------------ 4. mic
-static void testMic() {
-  Serial.println(F("--- 4. INMP441 microphone ---"));
 
-  if (!micInit()) { Serial.println(F("mic setup failed - test skipped\n")); return; }
-  micStart();
+static void addSample(ChStat &c, int32_t v) {
+  if (v > c.mx) c.mx = v;
+  if (v < c.mn) c.mn = v;
+  c.sq8  += (double)(v >> 8)  * (v >> 8);
+  c.sq11 += (double)(v >> 11) * (v >> 11);
+  c.sq12 += (double)(v >> 12) * (v >> 12);
+  c.n++;
+}
 
-  static int32_t buf[I2S_BUF_FRAMES];
-  for (int i = 0; i < 6; i++) micRead(buf, sizeof(buf));   // drop stale DMA
+static void printCh(const char *name, const ChStat &c) {
+  Serial.printf("%s raw min/max : %ld / %ld\n", name, (long)c.mn, (long)c.mx);
+  if (c.n == 0) return;
+  Serial.printf("%s RMS shift 8 : %.1f\n", name, sqrt(c.sq8  / c.n));
+  Serial.printf("%s RMS shift 11: %.1f\n", name, sqrt(c.sq11 / c.n));
+  Serial.printf("%s RMS shift 12: %.1f\n", name, sqrt(c.sq12 / c.n));
+}
 
-  Serial.println(F("listening 4 s - hum, talk, or tap the table..."));
-
-  double  sq8 = 0, sq11 = 0, sq12 = 0;
-  int64_t abs8 = 0, n = 0;
-  int32_t peak = 0, maxRaw = 0, minRaw = 0;
-
+static void listenPhase(const char *title, uint32_t ms) {
+  static int32_t buf[I2S_BUF_FRAMES * 2];
+  ChStat raw, fix, B;
+  uint32_t prevBlsb = 0;
+  bool havePrev = false;
   uint32_t t0 = millis();
-  while (millis() - t0 < (uint32_t)MIC_SECONDS * 1000UL) {
+  while (millis() - t0 < ms) {
     size_t br = micRead(buf, sizeof(buf));
     if (br == 0) break;
     int cnt = br / 4;
-    for (int i = 0; i < cnt; i++) {
-      int32_t v = buf[i];
-      if (v > maxRaw) maxRaw = v;
-      if (v < minRaw) minRaw = v;
-      int32_t s = v >> 8;
-      if (labs((long)s) > labs((long)peak)) peak = s;
-      abs8 += labs((long)s);
-      sq8  += (double)s * s;
-      sq11 += (double)(v >> 11) * (v >> 11);
-      sq12 += (double)(v >> 12) * (v >> 12);
-      n++;
+    for (int i = 0; i + 1 < cnt; i += 2) {
+      int32_t a = buf[i], b = buf[i + 1];
+      addSample(raw, a);
+      addSample(B, b);
+      if (havePrev) {
+        // data arrives 1 bit early: sign bit sits in the previous slot B's LSB
+        int32_t c = (int32_t)((prevBlsb << 31) | ((uint32_t)a >> 1));
+        addSample(fix, c);
+      }
+      prevBlsb = (uint32_t)b & 1u;
+      havePrev = true;
     }
   }
+  Serial.printf("[%s]\n", title);
+  Serial.printf("  slot B min/max      : %ld / %ld\n", (long)B.mn, (long)B.mx);
+  if (raw.n) Serial.printf("  RAW   RMS shift 11  : %.1f   (min/max %ld / %ld)\n",
+                           sqrt(raw.sq11 / raw.n), (long)raw.mn, (long)raw.mx);
+  if (fix.n) Serial.printf("  FIXED RMS shift 11  : %.1f   shift 12: %.1f   (min/max %ld / %ld)\n",
+                           sqrt(fix.sq11 / fix.n), sqrt(fix.sq12 / fix.n), (long)fix.mn, (long)fix.mx);
+}
+
+static void testMic() {
+  Serial.println(F("--- 4. INMP441 microphone ---"));
+
+  pinMode(PIN_I2S_DIN, INPUT_PULLUP);   delay(5);
+  int withUp = digitalRead(PIN_I2S_DIN);
+  pinMode(PIN_I2S_DIN, INPUT_PULLDOWN); delay(5);
+  int withDown = digitalRead(PIN_I2S_DIN);
+  pinMode(PIN_I2S_DIN, INPUT);
+  Serial.printf("SD pin check : pullup->%d pulldown->%d  ", withUp, withDown);
+  if (withUp == 0 && withDown == 0)      Serial.println(F("(stuck LOW - SD wire touching GND?)"));
+  else if (withUp == 1 && withDown == 1) Serial.println(F("(stuck HIGH - SD wire touching 3.3V?)"));
+  else                                   Serial.println(F("(ok - not shorted)"));
+
+  if (!micInit()) { Serial.println(F("mic setup failed - test skipped\n")); return; }
+  micStart();
+  static int32_t warm[I2S_BUF_FRAMES * 2];
+  for (int i = 0; i < 8; i++) micRead(warm, sizeof(warm));   // mic start-up
+
+  Serial.println(F(">>> STAY SILENT for 3 s ..."));
+  delay(300);
+  listenPhase("silence", 3000);
+  Serial.println(F(">>> NOW HUM LOUDLY near the mic for 3 s ..."));
+  delay(700);
+  listenPhase("humming", 3000);
 
   micStop();
   micFree();
-
-  if (n == 0) { Serial.println(F("no samples read at all\n")); return; }
-
-  Serial.printf("samples      : %lld\n", (long long)n);
-  Serial.printf("raw min/max  : %ld / %ld\n", (long)minRaw, (long)maxRaw);
-  Serial.printf("mean |v>>8|  : %ld\n", (long)(abs8 / n));
-  Serial.printf("peak  v>>8   : %ld\n", (long)peak);
-  Serial.printf("RMS  shift 8 : %.1f\n", sqrt(sq8  / n));
-  Serial.printf("RMS  shift 11: %.1f\n", sqrt(sq11 / n));
-  Serial.printf("RMS  shift 12: %.1f\n", sqrt(sq12 / n));
-
-  if (maxRaw == 0 && minRaw == 0) {
-    Serial.println(F("VERDICT: all zeros - the mic is not sending data."));
-    Serial.println(F("  check VDD=3V3, GND=GND, SCK=GPIO0, WS=GPIO1, SD=GPIO3, L/R=GND"));
-  } else {
-    Serial.println(F("VERDICT: data is flowing. Send me the three RMS lines and I will"));
-    Serial.println(F("  say which shift is right. Room noise should read roughly 50-2000"));
-    Serial.println(F("  and humming should push it well past 10000."));
-  }
+  Serial.println(F("Paste both [silence] and [humming] blocks."));
+  Serial.println(F("Good result: FIXED is small in silence (~50-2000) and much bigger when humming."));
   Serial.println();
 }
 
@@ -290,12 +315,7 @@ static void testSD() {
 }
 
 // ------------------------------------------------------------------ run
-void setup() {
-  Serial.begin(115200);
-  delay(2500);                 // let the USB serial come up
-  pinMode(PIN_LED, OUTPUT);
-  led(false);
-
+static void runAll() {
   Serial.println();
   Serial.println(F("=========================================="));
   Serial.println(F("  pendant prototype - hardware test"));
@@ -306,14 +326,37 @@ void setup() {
   testLed();
   testButton();
   testMic();
+  SD.end();                    // safe to re-run the SD test
   testSD();
 
   Serial.println(F("=========================================="));
   Serial.println(F("  test finished. Paste everything above."));
+  Serial.println(F("  Press Enter in the Serial Monitor to run again."));
   Serial.println(F("=========================================="));
 }
 
+void setup() {
+  Serial.begin(115200);
+  pinMode(PIN_LED, OUTPUT);
+  led(false);
+
+  // Wait (up to 30 s) until the Serial Monitor is actually connected, so the
+  // report is never lost while the USB link reconnects after RESET.
+  uint32_t t0 = millis();
+  while (!Serial && millis() - t0 < 30000) {
+    led(true);  delay(100);    // fast flicker = waiting for Serial Monitor
+    led(false); delay(100);
+  }
+  delay(1000);
+
+  runAll();
+}
+
 void loop() {
+  if (Serial.available()) {    // Enter in the Serial Monitor = run again
+    while (Serial.available()) Serial.read();
+    runAll();
+  }
   led(true);  delay(50);       // slow heartbeat: board is alive
   led(false); delay(1950);
 }
