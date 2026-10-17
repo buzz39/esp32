@@ -8,14 +8,22 @@ the next, so when something breaks you know exactly what caused it.
 
 ## Where you are
 
+**Resuming on a different machine? Read `CONTEXT.md` first** — it has the full state
+snapshot, the verified wiring map, the blockers, and the machine gotchas.
+
 **Done:**
 - ESP32-C3 Super Mini bought, headers soldered, USB-C confirmed
-- Board plugs into the laptop and shows a COM port
-- LED lights up
+- LED lights up when plugged in (power confirmed)
 - INMP441 mic, microSD module, breadboard, jumper wires, buttons — all bought
+- Both sketches compiled clean against esp32 core 3.3.12
+
+**Not done yet — and the current blocker:**
+- ⚠️ **No ESP32 COM port has ever appeared.** The board powers up, but no device
+  enumerates. The LED only proves power, not data. **Check the USB cable is a *data*
+  cable before anything else** — a charge-only cable looks exactly like a working board.
+- Is the board sitting in the breadboard correctly (see Step 3) — pin direction unconfirmed
 
 **Not yet known:**
-- Is the board sitting in the breadboard correctly (see Step 3)
 - Are the mic's pins soldered
 - Do you have a microSD card
 - Do you have a soldering iron

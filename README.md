@@ -1,5 +1,9 @@
 # NeoClone — ₹500-ish DIY replica of Neo Sapien (Neo 1)
 
+> **Picking this up cold, or on a different machine? Read [`CONTEXT.md`](CONTEXT.md) first.**
+> It is the current state of play: what's built, what's verified, what's blocking, and what
+> to do next. The rest of these files are reference material.
+
 A pocket pendant. **Click the button, speak your thought, click to stop.** All the
 AI (transcription + summary + memory) runs on your phone or PC. The pendant is just
 a mic, a button, a battery and a bit of storage.
