@@ -1,0 +1,20 @@
+# Product photos of the real Neo 1 — manufacturer copyright, don't publish
+real/
+
+# Personal WhatsApp photos from the Sitabuldi trip
+market/
+
+# Python
+__pycache__/
+*.pyc
+
+# Arduino / build noise
+build/
+*.bin
+*.elf
+*.hex
+*.map
+.arduino/
+# Windows
+Thumbs.db
+desktop.ini
